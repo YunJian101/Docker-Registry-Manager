@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  # 官方registry:2容器
+  registry:
+    image: registry:2
+    container_name: docker_registry
+    ports:
+      - "5000:5000"  # Registry API端口
+    environment:
+      - REGISTRY_STORAGE_DELETE_ENABLED=true  # 启用删除功能
+      - REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY=/var/lib/registry
+    volumes:
+      - ./data/registry:/var/lib/registry  # 使用主机目录存储
+    restart: unless-stopped
+    networks:
+      - registry_network
+
+  # Web UI管理界面
+  web-ui:
+    image: alioth1/registry-ui:latest
+    container_name: registry_webui
+    ports:
+      - "5001:5001"  # Web UI端口
+    environment:
+      - REGISTRY_BASE_URL=http://registry:5000  # 连接registry容器
+      - REGISTRY_HOST=test.ue6.fun:8888  # 可配置的Registry外部地址，可通过compose文件修改
+      - PYTHONUNBUFFERED=1
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    volumes:
+      - ./data/registry:/var/lib/registry:ro  # 只读模式，确保安全
+      - /var/run/docker.sock:/var/run/docker.sock  # 挂载Docker socket
+      - ./config:/app/config:rw  # 配置目录映射，包含Mirror.json
+    depends_on:
+      - registry
+    restart: unless-stopped
+    networks:
+      - registry_network
+
+volumes:
+  registry_data:
+    driver: local
+
+networks:
+  registry_network:
+    driver: bridge
