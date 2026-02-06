@@ -12,5 +12,5 @@ services:
     volumes:
       - E:\AI-Project\Regsitry2\data\registry:/var/lib/registry:ro  # 只读模式，确保安全
       - /var/run/docker.sock:/var/run/docker.sock  # 挂载Docker socket
-      - ./config:/app/config:rw  # 配置目录映射
+      - ./:/app:rw  # 配置目录映射
     restart: unless-stopped
