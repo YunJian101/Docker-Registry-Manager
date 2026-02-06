@@ -314,6 +314,16 @@ class RegistryClient:
             'User-Agent': 'RegistryWebUI/1.0',
             'Accept': 'application/json'
         })
+    def get_manifest(self, repository: str, tag: str) -> Dict:
+        """获取manifest数据（增强版，支持多种格式）- 测试版本1"""
+        try:
+            # 添加明显的测试标识
+            logger.info("=== OCI INDEX DEBUG VERSION 1 ===")
+            return self._get_manifest(repository, tag)
+        except Exception as e:
+            logger.error(f"Error fetching manifest for {repository}:{tag}: {e}")
+            raise
+
     def get_repositories(self) -> List[str]:
         """获取所有仓库（智能发现完整仓库路径）"""
         try:
@@ -437,15 +447,42 @@ class RegistryClient:
             return []
 
     def get_manifest(self, repository: str, tag: str) -> Dict:
-        """获取manifest数据（增强版）"""
+        """获取manifest数据（增强版，支持多种格式）"""
         try:
-            response = self.session.get(
-                f"{self.base_url}/{repository}/manifests/{tag}",
-                headers={'Accept': 'application/vnd.docker.distribution.manifest.v2+json'},
-                timeout=10
-            )
-            response.raise_for_status()
-            manifest_data = response.json()
+            # 定义多种Accept头，按优先级排序
+            accept_headers = [
+                'application/vnd.docker.distribution.manifest.v2+json',  # Docker V2 Schema
+                'application/vnd.oci.image.manifest.v1+json',            # OCI Image Manifest
+                'application/vnd.oci.image.index.v1+json',               # OCI Image Index
+                'application/vnd.docker.distribution.manifest.list.v2+json'  # Docker Manifest List
+            ]
+            
+            manifest_data = None
+            used_accept_header = None
+            
+            # 尝试每种Accept头，直到成功获取数据
+            for accept_header in accept_headers:
+                try:
+                    response = self.session.get(
+                        f"{self.base_url}/{repository}/manifests/{tag}",
+                        headers={'Accept': accept_header},
+                        timeout=10
+                    )
+                    if response.status_code == 200:
+                        manifest_data = response.json()
+                        used_accept_header = accept_header
+                        logger.info(f"成功使用Accept头 {accept_header} 获取 {repository}:{tag} 的manifest")
+                        break
+                    elif response.status_code == 404:
+                        # 如果是404，说明标签不存在，直接抛出异常
+                        response.raise_for_status()
+                except Exception as e:
+                    logger.debug(f"使用Accept头 {accept_header} 获取manifest失败: {e}")
+                    continue
+            
+            # 如果所有尝试都失败，抛出异常
+            if manifest_data is None:
+                raise Exception(f"无法获取 {repository}:{tag} 的manifest，所有Accept头尝试失败")
             
             # 提取实际的镜像大小和创建时间
             total_size = 0
@@ -453,62 +490,278 @@ class RegistryClient:
             architecture = '未知'
             os_name = '未知'
             image_id = '未知'
+            media_type = manifest_data.get('mediaType', used_accept_header or '未知')
             
-            # 计算总大小（所有层的总和）
-            if 'layers' in manifest_data:
-                for layer in manifest_data['layers']:
-                    total_size += layer.get('size', 0)
+            # 初始化层信息列表
+            layers_info = []
+            history_info = []
+            diff_ids_info = []
             
-            # 从config获取创建时间和平台信息
-            if 'config' in manifest_data:
-                config_digest = manifest_data['config'].get('digest', '')
-                if config_digest:
-                    try:
-                        # 获取config blob详细信息
-                        config_response = self.session.get(
-                            f"{self.base_url}/{repository}/blobs/{config_digest}",
-                            timeout=10
-                        )
-                        if config_response.status_code == 200:
-                            config_data = config_response.json()
-                            created = config_data.get('created', '未知')
-                            architecture = config_data.get('architecture', '未知')
-                            os_name = config_data.get('os', '未知')
-                            image_id = config_digest.replace('sha256:', '')[:12]  # 取前12位作为精简ID
-                    except:
-                        pass  # 如果获取config失败，使用默认值
+            # 处理不同类型的manifest
+            if media_type in ['application/vnd.docker.distribution.manifest.v2+json', 
+                             'application/vnd.oci.image.manifest.v1+json']:
+                # 单一镜像manifest处理
+                logger.info(f"处理单一镜像manifest，layers数量: {len(manifest_data.get('layers', []))}")
+                # 计算总大小（所有层的总和）
+                if 'layers' in manifest_data:
+                    for layer in manifest_data['layers']:
+                        layer_size = layer.get('size', 0)
+                        total_size += layer_size
+                        # 保存详细的层信息
+                        layers_info.append({
+                            'digest': layer.get('digest', 'unknown'),
+                            'size': layer_size,
+                            'mediaType': layer.get('mediaType', 'unknown')
+                        })
+                
+                # 从config获取创建时间和平台信息
+                if 'config' in manifest_data:
+                    config_digest = manifest_data['config'].get('digest', '')
+                    if config_digest:
+                        try:
+                            # 获取config blob详细信息
+                            config_response = self.session.get(
+                                f"{self.base_url}/{repository}/blobs/{config_digest}",
+                                timeout=10
+                            )
+                            if config_response.status_code == 200:
+                                config_data = config_response.json()
+                                created = config_data.get('created', '未知')
+                                architecture = config_data.get('architecture', '未知')
+                                os_name = config_data.get('os', '未知')
+                                image_id = config_digest.replace('sha256:', '')[:12]  # 取前12位作为精简ID
+                                
+                                # 获取构建历史信息
+                                if 'history' in config_data:
+                                    history_info = config_data['history']
+                                
+                                # 获取diff_ids信息
+                                if 'rootfs' in config_data and 'diff_ids' in config_data['rootfs']:
+                                    diff_ids_info = config_data['rootfs']['diff_ids']
+                        except Exception as e:
+                            logger.warning(f"获取config失败: {e}")
+                            pass  # 如果获取config失败，使用默认值
+                            
+            elif media_type in ['application/vnd.oci.image.index.v1+json',
+                               'application/vnd.docker.distribution.manifest.list.v2+json']:
+                # OCI Index或Manifest List处理
+                logger.info(f"处理Index/List类型manifest，manifests数量: {len(manifest_data.get('manifests', []))}")
+                if 'manifests' in manifest_data and len(manifest_data['manifests']) > 0:
+                    # 优先选择有明确平台信息的manifest
+                    target_manifest = None
+                    for manifest_item in manifest_data['manifests']:
+                        platform = manifest_item.get('platform', {})
+                        arch = platform.get('architecture', 'unknown')
+                        os_type = platform.get('os', 'unknown')
+                        # 优先选择明确的平台信息
+                        if arch != 'unknown' and os_type != 'unknown':
+                            target_manifest = manifest_item
+                            break
+                    
+                    # 如果没有找到明确平台的，就用第一个
+                    if target_manifest is None:
+                        target_manifest = manifest_data['manifests'][0]
+                    
+                    total_size = target_manifest.get('size', 0)
+                    platform = target_manifest.get('platform', {})
+                    architecture = platform.get('architecture', '未知')
+                    os_name = platform.get('os', '未知')
+                    digest = target_manifest.get('digest', '')
+                    logger.info(f"选中的manifest: size={total_size}, arch={architecture}, os={os_name}, digest={digest}")
+                    if digest:
+                        image_id = digest.replace('sha256:', '')[:12]
+                        
+                    # 尝试获取具体的manifest来获得更详细信息
+                    if digest:
+                        try:
+                            logger.info(f"尝试获取具体manifest: {digest}")
+                            # 保持完整的digest（包含sha256:前缀）
+                            full_digest = digest
+                            
+                            # 按照OCI规范，尝试获取具体的manifest
+                            manifest_attempts = [
+                                # OCI Image Manifest格式
+                                {
+                                    'url': f"{self.base_url}/{repository}/manifests/{full_digest}",
+                                    'headers': {'Accept': 'application/vnd.oci.image.manifest.v1+json'}
+                                },
+                                # Docker V2格式（兼容性）
+                                {
+                                    'url': f"{self.base_url}/{repository}/manifests/{full_digest}",
+                                    'headers': {'Accept': 'application/vnd.docker.distribution.manifest.v2+json'}
+                                }
+                            ]
+                            
+                            specific_manifest = None
+                            for attempt in manifest_attempts:
+                                try:
+                                    logger.info(f"尝试获取manifest: {attempt['url']}")
+                                    response = self.session.get(
+                                        attempt['url'],
+                                        headers=attempt['headers'],
+                                        timeout=10
+                                    )
+                                    logger.info(f"Manifest响应状态: {response.status_code}")
+                                    
+                                    if response.status_code == 200:
+                                        specific_manifest = response.json()
+                                        logger.info(f"成功获取manifest，类型: {specific_manifest.get('mediaType', '未知')}")
+                                        logger.info(f"Manifest keys: {list(specific_manifest.keys())}")
+                                        break
+                                    elif response.status_code == 404:
+                                        logger.info(f"Manifest不存在: {attempt['url']}")
+                                        continue
+                                except Exception as manifest_e:
+                                    logger.info(f"Manifest获取失败: {manifest_e}")
+                                    continue
+                            
+                            if specific_manifest:
+                                # 处理层数据
+                                if 'layers' in specific_manifest:
+                                    layer_count = len(specific_manifest['layers'])
+                                    logger.info(f"Layers数量: {layer_count}")
+                                    total_size = 0  # 重新计算大小
+                                    for i, layer in enumerate(specific_manifest['layers']):
+                                        layer_size = layer.get('size', 0)
+                                        logger.info(f"Layer {i}: size={layer_size}, digest={layer.get('digest', 'unknown')}")
+                                        total_size += layer_size
+                                        # 保存详细的层信息
+                                        layers_info.append({
+                                            'digest': layer.get('digest', 'unknown'),
+                                            'size': layer_size,
+                                            'mediaType': layer.get('mediaType', 'unknown')
+                                        })
+                                    logger.info(f"计算得到的总大小: {total_size}")
+                                
+                                # 获取配置数据（按照OCI规范）
+                                if 'config' in specific_manifest:
+                                    config_digest = specific_manifest['config'].get('digest', '')
+                                    logger.info(f"Config digest: {config_digest}")
+                                    if config_digest:
+                                        # 按照OCI规范获取config blob
+                                        config_url = f"{self.base_url}/{repository}/blobs/{config_digest}"
+                                        logger.info(f"获取config: {config_url}")
+                                        
+                                        try:
+                                            config_response = self.session.get(config_url, timeout=10)
+                                            logger.info(f"Config响应状态: {config_response.status_code}")
+                                            
+                                            if config_response.status_code == 200:
+                                                config_data = config_response.json()
+                                                logger.info(f"Config数据keys: {list(config_data.keys())}")
+                                                
+                                                # 更新创建时间和平台信息
+                                                created = config_data.get('created', created)
+                                                architecture = config_data.get('architecture', architecture)
+                                                os_name = config_data.get('os', os_name)
+                                                image_id = config_digest.replace('sha256:', '')[:12]
+                                                
+                                                # 获取构建历史信息
+                                                if 'history' in config_data:
+                                                    history_info = config_data['history']
+                                                
+                                                # 获取diff_ids信息
+                                                if 'rootfs' in config_data and 'diff_ids' in config_data['rootfs']:
+                                                    diff_ids_info = config_data['rootfs']['diff_ids']
+                                                
+                                                logger.info(f"从config提取: created={created}, arch={architecture}, os={os_name}")
+                                            else:
+                                                logger.info(f"Config获取失败，状态码: {config_response.status_code}")
+                                        except Exception as config_e:
+                                            logger.info(f"Config获取异常: {config_e}")
+                            else:
+                                logger.info("无法获取具体的manifest，使用Index提供的基本信息")
+                        except Exception as e:
+                            logger.info(f"处理具体manifest时出错: {e}")
             
-            # 合并信息到manifest数据
-            manifest_data['total_size'] = total_size
-            manifest_data['created'] = created
-            manifest_data['architecture'] = architecture
-            manifest_data['os'] = os_name
-            manifest_data['image_id'] = image_id
+            # 构建返回数据，确保包含所有必要的信息
+            result = {
+                'total_size': total_size,
+                'size': total_size,  # 兼容性字段
+                'created': created,
+                'architecture': architecture,
+                'os': os_name,
+                'image_id': image_id,
+                'mediaType': media_type,
+                'schemaVersion': manifest_data.get('schemaVersion', '未知'),
+                'layers': layers_info,  # 确保返回详细的层信息
+                'history': history_info,  # 返回构建历史
+                'diff_ids': diff_ids_info,  # 返回diff_ids
+                'config': manifest_data.get('config', {})  # 返回原始config信息
+            }
             
-            return manifest_data
+            logger.info(f"返回结果 - 总大小: {total_size}, 层数: {len(layers_info)}, 历史数: {len(history_info)}")
+            return result
+            
         except Exception as e:
             logger.error(f"获取manifest失败 {repository}:{tag}: {e}")
-            return {'total_size': 0, 'created': '未知', 'architecture': '未知', 'os': '未知', 'image_id': '未知'}
+            # 返回基本的错误信息结构
+            return {
+                'total_size': 0,
+                'size': 0,
+                'created': '未知',
+                'architecture': '未知',
+                'os': '未知',
+                'image_id': '未知',
+                'mediaType': '未知',
+                'schemaVersion': '未知',
+                'layers': [],
+                'history': [],
+                'diff_ids': [],
+                'config': {},
+                'error': str(e)
+            }
 
     def delete_image(self, repository: str, tag: str) -> bool:
-        """删除镜像"""
+        """删除镜像 - 支持OCI镜像格式"""
         try:
+            # 首先获取manifest以确定正确的mediaType
+            manifest_info = self.get_manifest(repository, tag)
+            media_type = manifest_info.get('mediaType', '')
+            
+            # 根据mediaType确定正确的Accept头
+            accept_header_map = {
+                'application/vnd.oci.image.index.v1+json': 'application/vnd.oci.image.index.v1+json',
+                'application/vnd.oci.image.manifest.v1+json': 'application/vnd.oci.image.manifest.v1+json',
+                'application/vnd.docker.distribution.manifest.v2+json': 'application/vnd.docker.distribution.manifest.v2+json',
+                'application/vnd.docker.distribution.manifest.list.v2+json': 'application/vnd.docker.distribution.manifest.list.v2+json'
+            }
+            
+            # 默认使用Docker V2 Schema
+            accept_header = accept_header_map.get(media_type, 'application/vnd.docker.distribution.manifest.v2+json')
+            
+            logger.info(f"删除镜像 {repository}:{tag}, 使用Accept头: {accept_header}, mediaType: {media_type}")
+            
             # 先获取manifest digest
             response = self.session.head(
                 f"{self.base_url}/{repository}/manifests/{tag}",
-                headers={'Accept': 'application/vnd.docker.distribution.manifest.v2+json'},
+                headers={'Accept': accept_header},
                 timeout=10
             )
+            
+            # 检查响应状态码
+            if response.status_code != 200:
+                logger.error(f"获取manifest失败，状态码: {response.status_code}")
+                return False
+                
             digest = response.headers.get('Docker-Content-Digest', '')
             if not digest:
+                logger.error(f"无法获取Docker-Content-Digest头部")
                 return False
             
+            logger.info(f"获取到digest: {digest}")
+            
             # 使用digest删除
-            response = self.session.delete(
+            delete_response = self.session.delete(
                 f"{self.base_url}/{repository}/manifests/{digest}",
                 timeout=10
             )
-            return response.status_code in [202, 404]
+            
+            success = delete_response.status_code in [202, 404]
+            logger.info(f"删除操作结果: 状态码={delete_response.status_code}, 成功={success}")
+            
+            return success
+            
         except Exception as e:
             logger.error(f"删除镜像失败 {repository}:{tag}: {e}")
             return False
@@ -3543,9 +3796,14 @@ def api_tag_details(repository: str, tag: str):
             'digest': manifest.get('config', {}).get('digest', '未知'),
             'architecture': manifest.get('architecture', '未知'),
             'os': manifest.get('os', '未知'),
-            'layers': manifest.get('layers', []),
+            'layers': manifest.get('layers', []),  # 确保返回层信息
+            'history': manifest.get('history', []),  # 添加构建历史
+            'diff_ids': manifest.get('diff_ids', []),  # 添加diff_ids用于关联
             'mediaType': manifest.get('mediaType', '未知'),
-            'schemaVersion': manifest.get('schemaVersion', '未知')
+            'schemaVersion': manifest.get('schemaVersion', '未知'),
+            'layers_count': len(manifest.get('layers', [])),  # 明确的层数字段
+            'has_layers': len(manifest.get('layers', [])) > 0,  # 层存在标志
+            'has_history': len(manifest.get('history', [])) > 0  # 历史存在标志
         }
         
         # 尝试获取更详细的config信息
@@ -3567,17 +3825,21 @@ def api_tag_details(repository: str, tag: str):
                                 'env': config_data.get('config', {}).get('Env', []),
                                 'volumes': config_data.get('config', {}).get('Volumes', {}),
                                 'user': config_data.get('config', {}).get('User', ''),
-                                'labels': config_data.get('config', {}).get('Labels', {})
+                                'labels': config_data.get('config', {}).get('Labels', {}),
+                                'exposed_ports': config_data.get('config', {}).get('ExposedPorts', {})
                             }
                         })
-                except:
+                except Exception as e:
+                    logger.warning(f"获取详细config信息失败: {e}")
                     pass
         
+        logger.info(f"标签详情API返回 - 层数: {tag_info['layers_count']}, 有层: {tag_info['has_layers']}")
         return jsonify({
             'success': True,
             'data': tag_info
         })
     except Exception as e:
+        logger.error(f"获取标签详情失败 {repository}:{tag}: {e}")
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/api/restart-registry', methods=['POST'])

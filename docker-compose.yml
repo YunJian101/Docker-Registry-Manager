@@ -18,19 +18,19 @@ services:
 
   # Web UI管理界面
   web-ui:
-    image: alioth1/registry-ui:latest
+    build: .  # 从当前目录的Dockerfile构建
     container_name: registry_webui
     ports:
       - "5001:5001"  # Web UI端口
     environment:
       - REGISTRY_BASE_URL=http://registry:5000  # 连接registry容器
-      - REGISTRY_HOST=test.ue6.fun:8888  # 可配置的Registry外部地址，可通过compose文件修改
+      - REGISTRY_HOST=localhost:5000  # Registry外部访问地址
       - PYTHONUNBUFFERED=1
       - DOCKER_HOST=unix:///var/run/docker.sock
     volumes:
       - ./data/registry:/var/lib/registry:ro  # 只读模式，确保安全
       - /var/run/docker.sock:/var/run/docker.sock  # 挂载Docker socket
-      - ./config:/app/config:rw  # 配置目录映射，包含Mirror.json
+      - ./config:/app/config:rw  # 配置目录映射
     depends_on:
       - registry
     restart: unless-stopped
