@@ -1,14 +1,7 @@
 FROM python:3.9-slim
 
-# 安装系统依赖和Docker客户端
+# 安装系统依赖
 RUN apt-get update && apt-get install -y \
-    curl \
-    gnupg \
-    lsb-release \
-    && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null \
-    && apt-get update \
-    && apt-get install -y docker-ce-cli \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -28,5 +21,5 @@ RUN mkdir -p /app/config && chmod 777 /app/config && \
 # 暴露端口
 EXPOSE 5001
 
-# 启动应用
-CMD ["python", "registry_web.py"]
+# 启动应用 - 使用新的入口文件
+CMD ["python", "-m", "backend.run"]

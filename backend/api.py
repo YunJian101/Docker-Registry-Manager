@@ -15,15 +15,15 @@ from urllib.parse import unquote
 import subprocess
 import logging
 
-# 导入后端模块
-from backend.config import (
+# 导入后端模块（相对导入）
+from .config import (
     CONFIG_DIR, DATA_DIR, MIRROR_FILE_PATH,
     REGISTRY_BASE_URL, REGISTRY_HOST,
     DEBUG_MODE, LOG_LEVEL,
     ensure_directories, get_registry_config
 )
-from backend.cache import mirror_cache
-from backend.registry_api import registry_client
+from .cache import mirror_cache
+from .registry_api import registry_client
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -43,7 +43,7 @@ ensure_directories()
 @app.route('/')
 def index():
     """主页面"""
-    return send_from_directory('frontend', 'index.html')
+    return send_from_directory('../frontend', 'index.html')
 
 
 
@@ -613,4 +613,12 @@ def api_clear_mirror_cache():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5001, debug=True)
+
+
+
+
+
+
+
+
 
