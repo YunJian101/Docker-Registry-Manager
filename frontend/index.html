@@ -982,13 +982,13 @@
             const isDetailPage = document.querySelector('.repository-detail') || document.querySelector('.detail-view');
 
             await loadStorageStats();
-            await loadRepoStats();
 
-            // 只在非详情页时加载仓库列表
+            // 只在非详情页时加载仓库列表，loadRepositories 会同步更新统计数据
             if (!isDetailPage) {
                 await loadRepositories();
             } else {
-                console.log('在详情页，跳过仓库列表加载');
+                // 在详情页时单独加载统计数据
+                await loadRepoStats();
             }
         }
         // 加载存储统计
@@ -1023,21 +1023,26 @@
         }
         
         // 加载仓库统计
-        async function loadRepoStats() {
+        async function loadRepoStats(repositories = null) {
             try {
                 const repoStatsElem = document.getElementById('repo-stats');
                 if (!repoStatsElem) {
                     console.warn('repo-stats 元素未找到');
                     return;
                 }
-                
-                const response = await fetch(`${API_BASE}/repositories`);
-                const data = await response.json();
-                
+
+                let data;
+                if (repositories) {
+                    data = { repositories };
+                } else {
+                    const response = await fetch(`${API_BASE}/repositories`);
+                    data = await response.json();
+                }
+
                 if (data.repositories) {
                     const totalRepos = data.repositories.length;
                     const totalTags = data.repositories.reduce((sum, repo) => sum + repo.tag_count, 0);
-                    
+
                     // 显示总共多少个仓库（不随分页改变）
                     repoStatsElem.innerHTML = `
                         <div class="stat">${totalRepos}</div>
@@ -1195,6 +1200,8 @@
                     console.log(`成功获取 ${allRepositories.length} 个仓库`);
                     currentPage = 1; // 重置到第一页
                     renderRepositoriesPage(); // 渲染第一页
+                    // 同步更新统计数据，避免重复请求
+                    loadRepoStats(allRepositories);
                 } else {
                     throw new Error('API返回数据格式不正确: 缺少repositories字段');
                 }
@@ -2481,13 +2488,13 @@
             const isDetailPage = document.querySelector('.repository-detail') || document.querySelector('.detail-view');
 
             await loadStorageStats();
-            await loadRepoStats();
 
-            // 只在非详情页时加载仓库列表
+            // 只在非详情页时加载仓库列表，loadRepositories 会同步更新统计数据
             if (!isDetailPage) {
                 await loadRepositories();
             } else {
-                console.log('在详情页，跳过仓库列表加载');
+                // 在详情页时单独加载统计数据
+                await loadRepoStats();
             }
         }
         

@@ -35,7 +35,7 @@ def ensure_directories():
 def delayed_cache_clear():
     """延迟执行缓存清空操作"""
     def clear_cache_task():
-        time.sleep(3)  # 延迟3秒执行
+        time.sleep(2)  # 延迟2秒执行
         try:
             # 确保导入缓存模块
             from backend.cache import redis_cache as mirror_cache
