@@ -1,0 +1,21 @@
+name: Tag Monitor
+
+on:
+  push:
+    tags:
+      - '**'
+      - '!v[0-9]+.[0-9]+.[0-9]+'
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Non-release Tag Notification
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          echo "🏷️  Non-release tag created: $TAG_NAME"
+          echo "No build or release will be triggered for this tag"
+      - name: Slack Notification (Optional)
+        if: failure()
+        run: |
+          echo "Tag monitoring completed successfully"

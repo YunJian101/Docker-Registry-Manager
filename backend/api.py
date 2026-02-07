@@ -876,18 +876,38 @@ def api_repository_description(repository: str):
     """API: 获取仓库的描述信息 - 使用Redis缓存（永久有效）"""
     try:
         repository = unquote(repository)
-        
-        # 先尝试从缓存获取
+
         cache_key = f"api:description:{repository}"
+
+        # 检查文件是否被修改
+        file_changed = False
+        if hasattr(mirror_cache, '_check_file_changed'):
+            if mirror_cache._check_file_changed():
+                logger.info(f"Mirror.json文件已修改，清除仓库 {repository} 的API缓存和Redis缓存")
+                mirror_cache._invalidate_cache(cache_key)
+                file_changed = True
+
+                # 更新文件修改时间
+                try:
+                    from backend.config import get_mirror_file_path
+                    mirror_file = get_mirror_file_path()
+                    mirror_cache._file_mtime = mirror_file.stat().st_mtime if mirror_file.exists() else 0
+                except Exception as e:
+                    logger.error(f"更新文件修改时间失败: {e}")
+
+        # 先尝试从缓存获取
         cached_result = mirror_cache.get_cached_api_result(cache_key)
-        if cached_result:
+        if cached_result and not file_changed:
             logger.debug(f"从Redis缓存返回仓库描述: {repository}")
             return jsonify(cached_result)
-        
-        # 缓存未命中，调用实际API
-        description_data = mirror_cache.get_repo_info(repository)
+
+        # 文件已修改或缓存未命中，直接从文件读取
+        logger.info(f"从文件读取仓库描述: {repository}")
+        from backend.cache.redis_cache import BaseCache
+        base_cache = BaseCache()
+        description_data = base_cache.get_repo_info(repository)
         response_data = {'success': True, 'data': description_data}
-        
+
         # 只有在成功获取到有效数据时才缓存
         if description_data is not None and response_data['success'] == True:
             # 缓存结果到Redis，设置永久有效（1年）
@@ -895,7 +915,7 @@ def api_repository_description(repository: str):
             logger.info(f"仓库描述API调用成功，结果已永久缓存到Redis: {repository}")
         else:
             logger.warning(f"仓库描述API返回空结果，跳过缓存: {repository}")
-        
+
         return jsonify(response_data)
     except requests.exceptions.RequestException as e:
         logger.error(f"仓库描述API网络请求失败 {repository}: {e}")

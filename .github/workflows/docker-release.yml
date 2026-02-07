@@ -1,0 +1,79 @@
+name: Docker Image Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Parse Version
+        id: version
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          MAJOR=$(echo $TAG_NAME | cut -d. -f1 | sed 's/v//')
+          MINOR=$(echo $TAG_NAME | cut -d. -f2)
+          
+          echo "MAJOR_VERSION=v$MAJOR" >> $GITHUB_OUTPUT
+          echo "MINOR_VERSION=v$MAJOR.$MINOR" >> $GITHUB_OUTPUT
+          echo "FULL_VERSION=$TAG_NAME" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push Images to GitHub Container Registry
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/docker-registry-manager:${{ steps.version.outputs.FULL_VERSION }}
+            ghcr.io/${{ github.repository_owner }}/docker-registry-manager:${{ steps.version.outputs.MINOR_VERSION }}
+            ghcr.io/${{ github.repository_owner }}/docker-registry-manager:latest
+
+      - name: Extract Release Notes
+        id: changelog
+        run: |
+          VERSION=${{ steps.version.outputs.FULL_VERSION }}
+          START_LINE=$(grep -n "^## \[$VERSION\]" CHANGELOG.md | head -1 | cut -d: -f1)
+          
+          if [ ! -z "$START_LINE" ]; then
+            END_LINE=$(awk "NR > $START_LINE && /^## \[/ {print NR; exit}" CHANGELOG.md)
+            if [ ! -z "$END_LINE" ]; then
+              sed -n "${START_LINE},$(($END_LINE-1))p" CHANGELOG.md > release_notes.md
+            else
+              sed -n "${START_LINE},\$p" CHANGELOG.md > release_notes.md
+            fi
+            tail -n +2 release_notes.md > temp.md && mv temp.md release_notes.md
+          else
+            echo "## What's Changed" > release_notes.md
+          fi
+          
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          cat release_notes.md >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: ${{ steps.version.outputs.FULL_VERSION }}
+          body: ${{ steps.changelog.outputs.notes }}

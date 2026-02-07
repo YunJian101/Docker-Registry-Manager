@@ -176,6 +176,7 @@ class RedisCache(BaseCache):
     _redis_client = None
     _redis_connected = False
     _warmup_completed = False
+    _file_mtime = None  # 文件修改时间记录
     
     def __new__(cls):
         if cls._instance is None:
@@ -507,20 +508,69 @@ class RedisCache(BaseCache):
             logger.error(f"预加载数据到Redis失败: {e}")
             self._warmup_completed = False
     
+    def _check_file_changed(self) -> bool:
+        """检查文件是否被修改"""
+        try:
+            mirror_file = get_mirror_file_path()
+            if not mirror_file.exists():
+                return False
+
+            current_mtime = mirror_file.stat().st_mtime
+
+            # 如果没有记录过修改时间，或者文件已修改
+            if self._file_mtime is None or self._file_mtime < current_mtime:
+                logger.info(f"检测到Mirror.json文件已更新，旧mtime: {self._file_mtime}, 新mtime: {current_mtime}")
+                # 不在这里更新 _file_mtime，让调用者决定何时更新
+                return True
+
+            return False
+        except Exception as e:
+            logger.error(f"检查文件修改时间失败: {e}")
+            return False
+
     # 重写父类方法，添加Redis缓存支持
     def get_repo_info(self, repository: str) -> Dict:
-        """获取仓库信息，优先从Redis获取"""
-        # 1. 先尝试从Redis获取
+        """获取仓库信息，优先从Redis获取，Redis未命中则回退到文件"""
+        # 1. 检查文件是否被修改
+        file_changed = self._check_file_changed()
+        if file_changed:
+            # 文件已修改，清除该仓库的Redis缓存
+            logger.info(f"文件已修改，清除仓库 {repository} 的Redis缓存")
+            cache_key = self._get_cache_key('repo_info', repo_name=repository)
+            if self._redis_connected:
+                try:
+                    self._redis_client.delete(cache_key)
+                except Exception as e:
+                    logger.warning(f"清除Redis缓存失败: {e}")
+
+            # 更新文件修改时间
+            try:
+                mirror_file = get_mirror_file_path()
+                self._file_mtime = mirror_file.stat().st_mtime if mirror_file.exists() else 0
+            except Exception as e:
+                logger.error(f"更新文件修改时间失败: {e}")
+
+        # 2. 先尝试从Redis获取
         cache_key = self._get_cache_key('repo_info', repo_name=repository)
         cached_data = self._get_from_redis(cache_key)
-        
+
         if cached_data:
             logger.debug(f"从Redis缓存获取仓库信息: {repository}")
             return cached_data
-        
-        # 2. Redis未命中，返回空字典（不再依赖父类）
-        logger.debug(f"Redis缓存未命中: {repository}")
-        return {}
+
+        # 3. Redis未命中，调用父类方法从文件读取
+        logger.info(f"Redis缓存未命中，从文件读取: {repository}")
+        file_data = super().get_repo_info(repository)
+
+        # 4. 将文件数据写入Redis缓存
+        if file_data and self._redis_connected:
+            try:
+                self._set_to_redis(cache_key, file_data, ttl=1800)
+                logger.info(f"已将仓库信息写入Redis缓存: {repository}")
+            except Exception as e:
+                logger.warning(f"写入Redis缓存失败: {e}")
+
+        return file_data
     
     def update_repo_info(self, repository: str, description: str, category: str = None, tags: List[str] = None) -> bool:
         """更新仓库信息，同时更新Redis和文件缓存"""
@@ -532,39 +582,97 @@ class RedisCache(BaseCache):
                 logger.info(f"清除仓库缓存: {repository}")
             except Exception as e:
                 logger.error(f"清除Redis缓存失败: {e}")
-        
+
         # 2. 清除仓库列表缓存（因为可能影响列表）
         self._invalidate_cache('registry:repos:list')
-        
-        return True
+
+        # 3. 调用父类方法更新文件
+        success = super().update_repo_info(repository, description, category, tags)
+
+        # 4. 更新成功后，将新数据写入Redis
+        if success and self._redis_connected:
+            try:
+                new_data = {
+                    "description": description,
+                    "category": category or "unknown",
+                    "tags": tags or []
+                }
+                self._set_to_redis(cache_key, new_data, ttl=1800)
+                logger.info(f"更新仓库信息并写入Redis缓存: {repository}")
+            except Exception as e:
+                logger.warning(f"写入Redis缓存失败: {e}")
+
+        return success
     
     def get_repositories(self) -> List[str]:
-        """获取仓库列表，使用Redis缓存"""
-        # 1. 先尝试从Redis获取
+        """获取仓库列表，使用Redis缓存，Redis未命中则回退到文件"""
+        # 1. 检查文件是否被修改
+        if self._check_file_changed():
+            # 文件已修改，清除仓库列表Redis缓存
+            logger.info("文件已修改，清除仓库列表Redis缓存")
+            cache_key = self._get_cache_key('repos_list')
+            if self._redis_connected:
+                try:
+                    self._redis_client.delete(cache_key)
+                except Exception as e:
+                    logger.warning(f"清除Redis缓存失败: {e}")
+
+        # 2. 先尝试从Redis获取
         cache_key = self._get_cache_key('repos_list')
         cached_repos = self._get_from_redis(cache_key)
-        
+
         if cached_repos:
             logger.debug("从Redis缓存获取仓库列表")
             return cached_repos
-        
-        # 2. Redis未命中，返回空列表
-        logger.debug("Redis缓存未命中仓库列表")
-        return []
+
+        # 3. Redis未命中，调用父类方法从文件读取
+        logger.debug("Redis缓存未命中，从文件读取仓库列表")
+        file_repos = super().get_repositories()
+
+        # 4. 将文件数据写入Redis缓存
+        if file_repos and self._redis_connected:
+            try:
+                self._set_to_redis(cache_key, file_repos, ttl=1800)
+                logger.debug("已将仓库列表写入Redis缓存")
+            except Exception as e:
+                logger.warning(f"写入Redis缓存失败: {e}")
+
+        return file_repos
     
     def get_tags(self, repository: str) -> List[str]:
-        """获取仓库标签，使用Redis缓存"""
-        # 1. 先尝试从Redis获取
+        """获取仓库标签，使用Redis缓存，Redis未命中则回退到文件"""
+        # 1. 检查文件是否被修改
+        if self._check_file_changed():
+            # 文件已修改，清除该仓库标签的Redis缓存
+            logger.info(f"文件已修改，清除仓库 {repository} 的标签Redis缓存")
+            cache_key = self._get_cache_key('repo_tags', repo_name=repository)
+            if self._redis_connected:
+                try:
+                    self._redis_client.delete(cache_key)
+                except Exception as e:
+                    logger.warning(f"清除Redis缓存失败: {e}")
+
+        # 2. 先尝试从Redis获取
         cache_key = self._get_cache_key('repo_tags', repo_name=repository)
         cached_tags = self._get_from_redis(cache_key)
-        
+
         if cached_tags is not None:
             logger.debug(f"从Redis缓存获取标签: {repository}")
             return cached_tags
-        
-        # 2. Redis未命中，返回空列表
-        logger.debug(f"Redis缓存未命中标签: {repository}")
-        return []
+
+        # 3. Redis未命中，调用父类方法从文件读取
+        logger.debug(f"Redis缓存未命中，从文件读取标签: {repository}")
+        file_tags = super().get_tags(repository)
+
+        # 4. 将文件数据写入Redis缓存
+        if file_tags and self._redis_connected:
+            try:
+                self._set_to_redis(cache_key, file_tags, ttl=1800)
+                logger.debug(f"已将标签列表写入Redis缓存: {repository}")
+            except Exception as e:
+                logger.warning(f"写入Redis缓存失败: {e}")
+
+        return file_tags
     
     # 新增方法：缓存API调用结果
     def cache_api_result(self, api_endpoint: str, data: Any, ttl: int = 1800) -> bool:
