@@ -42,10 +42,10 @@ jobs:
           # 检查是否符合语义化版本 (major.minor.patch)
           if [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "is_official=true" >> $GITHUB_OUTPUT
-            echo "✓ Official release version: $VERSION"
+            echo "Official release version: $VERSION"
           else
             echo "is_official=false" >> $GITHUB_OUTPUT
-            echo "✗ Non-official version: $VERSION"
+            echo "Non-official version: $VERSION"
           fi
 
       - name: Extract changelog
