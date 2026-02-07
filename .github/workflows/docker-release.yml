@@ -51,7 +51,10 @@ jobs:
         id: changelog
         run: |
           VERSION=${{ steps.version.outputs.FULL_VERSION }}
-          START_LINE=$(grep -n "^## \[$VERSION\]" CHANGELOG.md | head -1 | cut -d: -f1)
+          # 移除版本号中的'v'前缀用于匹配CHANGELOG
+          CLEAN_VERSION=${VERSION#v}
+          
+          START_LINE=$(grep -n "^## \[v${CLEAN_VERSION}\]" CHANGELOG.md | head -1 | cut -d: -f1)
           
           if [ ! -z "$START_LINE" ]; then
             END_LINE=$(awk "NR > $START_LINE && /^## \[/ {print NR; exit}" CHANGELOG.md)
@@ -70,10 +73,10 @@ jobs:
           echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Create Release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: ncipollo/release-action@v1
         with:
-          tag_name: ${{ github.ref }}
-          release_name: ${{ steps.version.outputs.FULL_VERSION }}
+          tag: ${{ github.ref_name }}
+          name: ${{ steps.version.outputs.FULL_VERSION }}
           body: ${{ steps.changelog.outputs.notes }}
+          draft: false
+          prerelease: false
