@@ -8,8 +8,25 @@ Cache Management Module
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Any
-from .config import get_mirror_file_path, get_config_dir
+from typing import Dict, List, Any  # 添加缺失的类型导入
+import sys
+import os
+
+# 添加backend目录到Python路径
+backend_path = '/app/backend'
+if backend_path not in sys.path:
+    sys.path.insert(0, backend_path)
+
+# 导入配置
+try:
+    from config import get_mirror_file_path, get_config_dir
+except ImportError:
+    # 如果相对导入失败，使用绝对路径
+    def get_mirror_file_path():
+        return Path("/app/config/Mirror.json")
+    
+    def get_config_dir():
+        return Path("/app/config")
 
 logger = logging.getLogger('registry_backend.cache')
 

@@ -4,26 +4,39 @@ Docker Registry Web UI - 专业的Web管理界面
 支持镜像管理、存储清理、健康监控等功能
 """
 
-from flask import Flask, render_template, jsonify, request, send_from_directory
-import requests
+from flask import Flask, request, jsonify, render_template, send_from_directory
+#from flask_cors import CORS, cross_origin  # 移除CORS导入
 import os
-import json
-import shutil
-from pathlib import Path
-from typing import Dict, List, Any
-from urllib.parse import unquote
-import subprocess
 import logging
+import requests
+from urllib.parse import quote, unquote
+import json
+import time
+import docker  # 添加docker导入
+from pathlib import Path  # 添加Path导入
 
-# 导入后端模块（相对导入）
-from .config import (
-    CONFIG_DIR, DATA_DIR, MIRROR_FILE_PATH,
-    REGISTRY_BASE_URL, REGISTRY_HOST,
-    DEBUG_MODE, LOG_LEVEL,
-    ensure_directories, get_registry_config
-)
-from .cache import mirror_cache
-from .registry_api import registry_client
+# 开发环境下直接导入（避免相对导入问题）
+import sys
+sys.path.append('/app/backend')
+from registry_api import registry_client
+from config import ensure_directories  # 导入ensure_directories函数
+
+# 导入正确的缓存模块
+try:
+    from cache import mirror_cache
+except ImportError:
+    # 如果导入失败，创建一个简单的mock
+    class MockMirrorCache:
+        def get_repo_info(self, repository):
+            return {
+                "name": repository,
+                "description": f"这是一个Docker镜像仓库: {repository}",
+                "category": "unknown",
+                "tags": []
+            }
+        def update_repo_info(self, repository, description, category=None, tags=None):
+            return True
+    mirror_cache = MockMirrorCache()
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -45,8 +58,43 @@ def index():
     """主页面"""
     return send_from_directory('../frontend', 'index.html')
 
+def get_data_path():
+    """获取数据目录路径"""
+    # 检查环境变量
+    if 'REGISTRY_DATA_PATH' in os.environ:
+        return os.environ['REGISTRY_DATA_PATH']
+    
+    # 默认路径（根据docker-compose配置）
+    default_path = '/var/lib/registry'
+    if os.path.exists(default_path):
+        return default_path
+    
+    # Windows环境下的路径
+    windows_path = 'E:\\AI-Project\\Regsitry2\\data\\registry'
+    if os.path.exists(windows_path):
+        return windows_path
+    
+    # 当前目录下的data文件夹
+    local_data = os.path.join(os.getcwd(), 'data')
+    if os.path.exists(local_data):
+        return local_data
+    
+    return default_path
 
-
+def get_directory_size(path):
+    """获取目录总大小（字节）"""
+    total_size = 0
+    try:
+        if os.path.exists(path):
+            for dirpath, dirnames, filenames in os.walk(path):
+                for filename in filenames:
+                    filepath = os.path.join(dirpath, filename)
+                    if os.path.exists(filepath):
+                        total_size += os.path.getsize(filepath)
+    except Exception as e:
+        logger.warning(f"计算目录大小失败 {path}: {e}")
+        return 0
+    return total_size
 
 @app.route('/api/repositories')
 def api_repositories():
@@ -75,69 +123,113 @@ def api_tags(repository: str):
     return jsonify({'tags': tags})
 
 @app.route('/api/repository/<path:repository>/tag/<tag>', methods=['DELETE'])
-def api_delete_tag(repository: str, tag: str):
-    """API: 删除标签"""
-    # 解码repository和tag
-    repository = unquote(repository)
-    tag = unquote(tag)
-    success = registry_client.delete_image(repository, tag)
-    return jsonify({'success': success})
+#@cross_origin()  # 暂时移除CORS装饰器
+def api_delete_tag(repository, tag):
+    """删除指定标签的镜像"""
+    try:
+        repository = unquote(repository)  # URL解码仓库名
+        tag = unquote(tag)  # URL解码标签名
+        
+        logger.info(f"开始删除标签: {repository}:{tag}")
+        
+        # 使用带垃圾回收的删除方法（传入分离的参数）
+        result = registry_client.delete_image_with_gc(repository, tag)
+        
+        if result['success']:
+            # 获取删除前后的空间信息
+            try:
+                # 删除前的空间使用情况
+                pre_gc_size = get_directory_size(get_data_path())
+                
+                # 等待GC完成
+                time.sleep(2)
+                
+                # 删除后的空间使用情况
+                post_gc_size = get_directory_size(get_data_path())
+                freed_bytes = pre_gc_size - post_gc_size
+                
+                logger.info(f"标签删除成功: {repository}:{tag}, 释放空间: {freed_bytes} bytes")
+                
+                # 清除相关缓存
+                try:
+                    cache.invalidate_cache(f"registry:repo:{repository}*")
+                    cache.invalidate_cache(f"registry:manifest:{repository}:{tag}")
+                    cache.invalidate_cache("registry:repos:list")
+                except Exception as e:
+                    logger.warning(f"清除缓存失败 {repository}:{tag}: {e}")
+                
+                return jsonify({
+                    'success': True,
+                    'message': '标签删除成功',
+                    'repository': repository,
+                    'tag': tag,
+                    'freed_bytes': freed_bytes,
+                    'gc_result': result.get('gc_result', {})
+                })
+            except Exception as size_error:
+                logger.warning(f"计算释放空间失败: {size_error}")
+                return jsonify({
+                    'success': True,
+                    'message': '标签删除成功',
+                    'repository': repository,
+                    'tag': tag,
+                    'freed_bytes': result.get('gc_result', {}).get('freed_bytes', 0),
+                    'gc_result': result.get('gc_result', {})
+                })
+        else:
+            logger.error(f"标签删除失败: {repository}:{tag}, 错误: {result.get('message', '未知错误')}")
+            return jsonify({
+                'success': False,
+                'message': result.get('message', '镜像删除失败'),
+                'repository': repository,
+                'tag': tag
+            }), 500
+            
+    except Exception as e:
+        logger.error(f"删除标签时发生错误: {e}")
+        return jsonify({
+            'success': False,
+            'message': str(e),
+            'repository': repository,
+            'tag': tag
+        }), 500
 
 @app.route('/api/repository/<path:repository>', methods=['DELETE'])
 def api_delete_repository(repository: str):
-    """API: 删除整个仓库 - 符合Docker Distribution API V2规范"""
+    """API: 删除整个仓库并触发垃圾回收"""
     try:
         repository = unquote(repository)
-        deleted_tags = []
-        failed_tags = []
+        logger.info(f"开始删除仓库: {repository}")
         
-        # 1. 获取仓库的所有标签
-        try:
-            tags = registry_client.get_tags(repository)
-            logger.info(f"准备删除仓库 {repository} 的 {len(tags)} 个标签")
-        except Exception as e:
-            logger.error(f"获取仓库标签失败 {repository}: {e}")
-            return jsonify({
-                'success': False, 
-                'error': f'无法获取仓库标签: {str(e)}'
-            }), 500
+        # 使用带垃圾回收的删除方法
+        result = registry_client.delete_repository_with_gc(repository)
         
-        # 2. 删除所有标签（根据Docker Distribution API规范）
-        for tag in tags:
+        # 清除相关缓存
+        cache_keys_to_clear = [
+            f"registry:repo:{repository}*",
+            "registry:repos:list"
+        ]
+        
+        for cache_key in cache_keys_to_clear:
             try:
-                success = registry_client.delete_image(repository, tag)
-                if success:
-                    deleted_tags.append(tag)
-                    logger.info(f"成功删除标签: {repository}:{tag}")
-                else:
-                    failed_tags.append(tag)
-            except Exception as tag_error:
-                logger.error(f"删除标签失败 {repository}:{tag}: {tag_error}")
-                failed_tags.append(tag)
+                mirror_cache._invalidate_cache(cache_key)
+                logger.info(f"已清除缓存: {cache_key}")
+            except Exception as cache_error:
+                logger.warning(f"清除缓存失败 {cache_key}: {cache_error}")
         
-        # 3. 根据Docker Distribution规范，删除后需要运行垃圾回收才能真正释放空间
-        logger.info(f"提醒用户运行垃圾回收以释放存储空间")
-        
-        # 4. 返回删除结果
-        result = {
-            'success': True,
-            'message': f'仓库 {repository} 删除完成，请运行垃圾回收释放存储空间',
-            'repository': repository,
-            'total_tags': len(tags),
-            'deleted_tags': deleted_tags,
-            'failed_tags': failed_tags,
-            'deleted_count': len(deleted_tags),
-            'official_api_note': '根据Docker Distribution API V2规范，删除manifest后需要运行垃圾回收才能实际释放磁盘空间',
-            'gc_command': 'docker exec <registry-container> registry garbage-collect /etc/docker/registry/config.yml'
-        }
-        
-        return jsonify(result)
-        
+        if result['success']:
+            logger.info(f"仓库删除成功: {repository}")
+            return jsonify(result)
+        else:
+            logger.error(f"仓库删除失败: {repository}, 错误: {result.get('message', '未知错误')}")
+            return jsonify(result), 500
+            
     except Exception as e:
-        logger.error(f"删除仓库失败 {repository}: {e}")
+        logger.error(f"删除仓库异常 {repository}: {e}")
         return jsonify({
-            'success': False, 
-            'error': f'删除仓库失败: {str(e)}'
+            'success': False,
+            'message': f'删除仓库异常: {str(e)}',
+            'repository': repository
         }), 500
 
 @app.route('/api/storage')
@@ -289,62 +381,93 @@ def api_clean_empty():
 
 @app.route('/api/gc', methods=['POST'])
 def api_garbage_collection():
-    """API: 垃圾回收 - 使用Docker SDK执行garbage-collect命令"""
+    """API: 垃圾回收 - 使用Docker SDK执行garbage-collect命令（统一使用数组命令格式）"""
     try:
-        # 使用Docker SDK而不是命令行
         import docker
+        from datetime import datetime
         
         # 创建Docker客户端
         client = docker.from_env()
         
-        # 执行垃圾回收命令
         logger.info("执行垃圾回收命令...")
         
         # 在registry容器中执行garbage-collect命令
         container = client.containers.get('docker_registry')
         
-        # 执行命令并获取实时输出
+        # 执行命令并获取实时输出（使用数组形式，与删除时的GC保持一致）
         result = container.exec_run(
-            "registry garbage-collect /etc/docker/registry/config.yml",
+            ["registry", "garbage-collect", "/etc/docker/registry/config.yml"],
             stdout=True,
             stderr=True,
-            demux=True  # 分离stdout和stderr
+            demux=True
         )
         
-        # 处理输出结果
+        # 解析执行结果
         exit_code = result.exit_code
-        stdout = result.output[0].decode('utf-8') if result.output[0] else ""
-        stderr = result.output[1].decode('utf-8') if result.output[1] else ""
+        stdout_output = result.output[0].decode('utf-8') if result.output[0] else ""
+        stderr_output = result.output[1].decode('utf-8') if result.output[1] else ""
         
-        logger.info(f"垃圾回收执行完成，退出码: {exit_code}")
+        logger.info(f"GC stdout: {stdout_output}")
+        logger.info(f"GC stderr: {stderr_output}")
         
-        if exit_code == 0:
-            # 解析输出获取释放的空间信息
-            output_lines = stdout.split('\n')
-            freed_space_info = ""
-            for line in output_lines:
-                if 'freed' in line.lower() or 'blobs' in line.lower():
-                    freed_space_info = line.strip()
-                    break
+        # 分析输出判断执行结果
+        success = exit_code == 0
+        message = stdout_output.strip() if stdout_output else "垃圾回收执行完成"
+        
+        # 解析释放的空间
+        freed_bytes = 0
+        blobs_deleted = 0
+        manifests_deleted = 0
+        
+        if stdout_output:
+            # 查找删除统计信息
+            import re
+            # 匹配类似 "Deleting blob: /path/to/blob" 的行
+            blob_matches = re.findall(r'Deleting blob: .*', stdout_output)
+            manifest_matches = re.findall(r'Deleting manifest: .*', stdout_output)
             
+            blobs_deleted = len(blob_matches)
+            manifests_deleted = len(manifest_matches)
+            
+            # 如果有明确的统计信息
+            stats_match = re.search(r'(\d+) blobs and (\d+) manifests eligible for deletion', stdout_output)
+            if stats_match:
+                eligible_blobs = int(stats_match.group(1))
+                eligible_manifests = int(stats_match.group(2))
+                # 简单估算：每个blob平均1MB，每个manifest 1KB
+                freed_bytes = eligible_blobs * 1024 * 1024 + eligible_manifests * 1024
+        
+        gc_result = {
+            'success': success,
+            'message': message,
+            'container': 'docker_registry',
+            'exit_code': exit_code,
+            'stdout': stdout_output,
+            'stderr': stderr_output,
+            'blobs_deleted': blobs_deleted,
+            'manifests_deleted': manifests_deleted,
+            'freed_bytes': freed_bytes,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        if success:
+            logger.info(f"垃圾回收执行成功: {message}")
             return jsonify({
                 'success': True,
-                'message': f'垃圾回收执行成功: {freed_space_info}' if freed_space_info else '垃圾回收执行完成',
-                'stdout': stdout,
-                'stderr': stderr,
-                'returncode': exit_code,
-                'freed_space': freed_space_info or '未知'
+                'message': message,
+                'freed_space': message,  # 保持向前兼容
+                'gc_result': gc_result
             })
         else:
-            logger.error(f"垃圾回收失败: {stderr}")
+            error_msg = stderr_output or message or "垃圾回收执行失败"
+            logger.error(f"垃圾回收执行失败: {error_msg}")
             return jsonify({
                 'success': False,
-                'error': f'垃圾回收执行失败: {stderr}',
-                'stdout': stdout,
-                'stderr': stderr,
-                'returncode': exit_code
+                'message': error_msg,
+                'error': stderr_output,
+                'gc_result': gc_result
             }), 500
-        
+            
     except docker.errors.NotFound:
         logger.error("找不到docker_registry容器")
         return jsonify({
@@ -358,8 +481,12 @@ def api_garbage_collection():
             'error': f'Docker API错误: {str(e)}'
         }), 500
     except Exception as e:
-        logger.error(f"垃圾回收API调用失败: {e}")
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.error(f"垃圾回收执行异常: {e}")
+        return jsonify({
+            'success': False,
+            'message': str(e),
+            'error': str(e)
+        }), 500
 
 @app.route('/api/repository/<path:repository>/details')
 def api_repository_details(repository: str):
@@ -596,28 +723,9 @@ def api_update_repository_description(repository: str):
             return jsonify({'success': True, 'message': '描述信息更新成功'})
         else:
             return jsonify({'success': False, 'error': '更新失败'})
-    
     except Exception as e:
         logger.error(f"更新仓库描述失败 {repository}: {e}")
         return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/api/mirror/cache/clear', methods=['POST'])
-def api_clear_mirror_cache():
-    """API: 手动清空Mirror.json缓存"""
-    try:
-        mirror_cache.clear_cache()
-        return jsonify({'success': True, 'message': '缓存清空成功'})
-    except Exception as e:
-        logger.error(f"清空缓存失败: {e}")
-        return jsonify({'success': False, 'error': str(e)})
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001, debug=True)
-
-
-
-
-
 
 
 

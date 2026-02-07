@@ -11,7 +11,24 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Any
 from urllib.parse import quote
-from .config import REGISTRY_BASE_URL
+import sys
+import os
+
+# 添加backend目录到Python路径
+backend_path = '/app/backend'
+if backend_path not in sys.path:
+    sys.path.insert(0, backend_path)
+
+# 导入配置
+try:
+    from config import REGISTRY_BASE_URL
+except ImportError:
+    # 如果相对导入失败，尝试绝对导入
+    try:
+        sys.path.append('/app/backend')
+        from config import REGISTRY_BASE_URL
+    except ImportError:
+        REGISTRY_BASE_URL = "http://registry:5000/v2"
 
 logger = logging.getLogger('registry_backend.registry_api')
 
@@ -19,10 +36,13 @@ class RegistryClient:
     """Registry API客户端"""
     
     def __init__(self, registry_url: str = None):
-        # 优先使用环境变量，其次使用默认值
-        self.registry_url = registry_url or REGISTRY_BASE_URL
-        self.registry_url = self.registry_url.rstrip('/')
+        # 优先使用传入的URL，然后是环境变量，最后是配置文件中的默认值
+        base_url = registry_url or REGISTRY_BASE_URL
+        
+        # 确保基础URL不包含末尾的/v2，我们会自己添加
+        self.registry_url = base_url.rstrip('/').rstrip('/v2')
         self.base_url = f"{self.registry_url}/v2"
+        
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'RegistryWebUI/1.0',
@@ -47,9 +67,12 @@ class RegistryClient:
                         relative_path = manifest_file.relative_to(manifests_path)
                         # 将Windows路径分隔符\转换为标准的/
                         repository_path = str(relative_path.parent).replace('\\', '/')
+                        # 只有当路径不是根目录(".")时才添加
                         if repository_path and repository_path != ".":
                             found_manifest_repos.add(repository_path)
-                            all_repos.append(repository_path)
+                            # 避免重复添加
+                            if repository_path not in all_repos:
+                                all_repos.append(repository_path)
                 
                 # 第二步：检查并清理无效的仓库目录（谨慎操作）
                 logger.info("检查无效仓库目录...")
@@ -123,7 +146,7 @@ class RegistryClient:
             seen = set()
             
             for repo in all_repos:
-                if repo not in seen:
+                if repo not in seen and repo != "repositories":  # 过滤掉无效的"repositories"条目
                     seen.add(repo)
                     final_repos.append(repo)
             
@@ -469,6 +492,169 @@ class RegistryClient:
         except Exception as e:
             logger.error(f"删除镜像失败 {repository}:{tag}: {e}")
             return False
+
+    def trigger_garbage_collection(self) -> dict:
+        """触发垃圾回收"""
+        try:
+            import docker
+            
+            # 创建Docker客户端
+            client = docker.from_env()
+            
+            # 直接获取指定的registry容器
+            container = client.containers.get('docker_registry')
+            
+            logger.info("在容器 docker_registry 中执行垃圾回收")
+            
+            # 执行垃圾回收命令
+            result = container.exec_run(
+                ["registry", "garbage-collect", "/etc/docker/registry/config.yml"],
+                stdout=True,
+                stderr=True
+            )
+            
+            # 处理ExecResult对象
+            stdout_output = result.output.decode('utf-8') if result.output else ""
+            stderr_output = ""
+            
+            logger.info(f"GC stdout: {stdout_output}")
+            
+            # 解析GC结果
+            success = result.exit_code == 0
+            message = "垃圾回收执行完成"
+            
+            if "eligible for deletion" in stdout_output:
+                lines = [line.strip() for line in stdout_output.split('\n') if line.strip()]
+                last_message_line = lines[-2] if len(lines) > 1 else lines[-1]
+                message = last_message_line
+            
+            # 解析释放的空间
+            freed_bytes = 0
+            blobs_deleted = 0
+            manifests_deleted = 0
+            
+            if stdout_output:
+                # 查找实际删除的blob
+                import re
+                delete_matches = re.findall(r'Deleting blob: .*', stdout_output)
+                blobs_deleted = len(delete_matches)
+                
+                # 简单估算释放空间（每个blob平均1MB）
+                freed_bytes = blobs_deleted * 1024 * 1024
+            
+            return {
+                'success': success,
+                'message': message,
+                'container': 'docker_registry',
+                'exit_code': result.exit_code,
+                'stdout': stdout_output,
+                'stderr': stderr_output,
+                'blobs_deleted': blobs_deleted,
+                'manifests_deleted': manifests_deleted,
+                'freed_bytes': freed_bytes
+            }
+            
+        except Exception as e:
+            logger.error(f"垃圾回收执行失败: {e}")
+            return {
+                'success': False,
+                'message': str(e),
+                'container': 'unknown',
+                'error': str(e)
+            }
+
+    def delete_image_with_gc(self, repository: str, tag: str) -> dict:
+        """删除镜像并触发垃圾回收"""
+        try:
+            logger.info(f"开始删除镜像并触发垃圾回收: {repository}:{tag}")
+            
+            # 1. 执行删除操作
+            delete_success = self.delete_image(repository, tag)
+            
+            if not delete_success:
+                return {
+                    'success': False,
+                    'message': '镜像删除失败',
+                    'repository': repository,
+                    'tag': tag
+                }
+            
+            # 2. 触发垃圾回收
+            gc_result = self.trigger_garbage_collection()
+            
+            return {
+                'success': True,
+                'message': '镜像删除成功并已触发垃圾回收',
+                'repository': repository,
+                'tag': tag,
+                'gc_result': gc_result,
+                'freed_bytes': gc_result.get('freed_bytes', 0) if gc_result.get('success') else 0
+            }
+            
+        except Exception as e:
+            logger.error(f"删除镜像并触发GC失败 {repository}:{tag}: {e}")
+            return {
+                'success': False,
+                'message': f'删除镜像并触发GC失败: {str(e)}',
+                'repository': repository,
+                'tag': tag
+            }
+
+    def delete_repository_with_gc(self, repository: str) -> dict:
+        """删除整个仓库并触发垃圾回收"""
+        try:
+            logger.info(f"开始删除仓库并触发垃圾回收: {repository}")
+            
+            deleted_tags = []
+            failed_tags = []
+            
+            # 1. 获取所有标签
+            try:
+                tags = self.get_tags(repository)
+                logger.info(f"准备删除仓库 {repository} 的 {len(tags)} 个标签")
+            except Exception as e:
+                logger.error(f"获取仓库标签失败 {repository}: {e}")
+                return {
+                    'success': False,
+                    'message': f'无法获取仓库标签: {str(e)}',
+                    'repository': repository
+                }
+            
+            # 2. 删除所有标签
+            for tag in tags:
+                try:
+                    success = self.delete_image(repository, tag)
+                    if success:
+                        deleted_tags.append(tag)
+                        logger.info(f"成功删除标签: {repository}:{tag}")
+                    else:
+                        failed_tags.append(tag)
+                except Exception as tag_error:
+                    logger.error(f"删除标签失败 {repository}:{tag}: {tag_error}")
+                    failed_tags.append(tag)
+            
+            # 3. 触发垃圾回收
+            gc_result = self.trigger_garbage_collection()
+            
+            return {
+                'success': True,
+                'message': f'仓库删除完成并已触发垃圾回收',
+                'repository': repository,
+                'total_tags': len(tags),
+                'deleted_tags': deleted_tags,
+                'failed_tags': failed_tags,
+                'deleted_count': len(deleted_tags),
+                'gc_result': gc_result,
+                'freed_bytes': gc_result.get('freed_bytes', 0) if gc_result.get('success') else 0
+            }
+            
+        except Exception as e:
+            logger.error(f"删除仓库并触发GC失败 {repository}: {e}")
+            return {
+                'success': False,
+                'message': f'删除仓库并触发GC失败: {str(e)}',
+                'repository': repository
+            }
 
     def get_storage_info(self) -> Dict:
         """获取存储信息"""
