@@ -17,6 +17,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Set lowercase repository owner
+        id: repo_info
+        run: |
+          REPO_OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "repo_owner_lower=${REPO_OWNER_LOWER}" >> $GITHUB_OUTPUT
+
       - name: Extract version and major.minor from tag
         id: get_version
         run: |
@@ -94,8 +100,8 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/docker-registry-manager:v${{ steps.get_version.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/docker-registry-manager:v${{ steps.get_version.outputs.major_minor }}
+            ghcr.io/${{ steps.repo_info.outputs.repo_owner_lower }}/docker-registry-manager:v${{ steps.get_version.outputs.version }}
+            ghcr.io/${{ steps.repo_info.outputs.repo_owner_lower }}/docker-registry-manager:v${{ steps.get_version.outputs.major_minor }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -106,7 +112,7 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/docker-registry-manager:latest
+            ghcr.io/${{ steps.repo_info.outputs.repo_owner_lower }}/docker-registry-manager:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -122,9 +128,9 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "### Actions Performed:" >> $GITHUB_STEP_SUMMARY
             echo "- ✅ Created GitHub Release" >> $GITHUB_STEP_SUMMARY
-            echo "- ✅ Built and pushed Docker image: \`ghcr.io/${{ github.repository_owner }}/docker-registry-manager:latest\`" >> $GITHUB_STEP_SUMMARY
-            echo "- ✅ Built and pushed Docker image: \`ghcr.io/${{ github.repository_owner }}/docker-registry-manager:v${{ steps.get_version.outputs.major_minor }}\`" >> $GITHUB_STEP_SUMMARY
-            echo "- ✅ Built and pushed Docker image: \`ghcr.io/${{ github.repository_owner }}/docker-registry-manager:v${{ steps.get_version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- ✅ Built and pushed Docker image: \`ghcr.io/${{ steps.repo_info.outputs.repo_owner_lower }}/docker-registry-manager:latest\`" >> $GITHUB_STEP_SUMMARY
+            echo "- ✅ Built and pushed Docker image: \`ghcr.io/${{ steps.repo_info.outputs.repo_owner_lower }}/docker-registry-manager:v${{ steps.get_version.outputs.major_minor }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- ✅ Built and pushed Docker image: \`ghcr.io/${{ steps.repo_info.outputs.repo_owner_lower }}/docker-registry-manager:v${{ steps.get_version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
           else
             echo "⚠️ **Non-Official Version**" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
