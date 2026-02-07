@@ -4,13 +4,22 @@
 
 Docker Registry Manager 是一个现代化的私有Docker镜像仓库Web管理平台，采用前后端分离架构设计。基于Python Flask后端和原生Web前端技术栈，提供直观易用的图形化界面来管理和监控Docker Registry服务。
 
-**当前版本**: v1.1.1
 
 ### 🎯 核心特性
 - **前后端分离架构**: 清晰的代码结构，便于维护和扩展
 - **Redis缓存优化**: 高性能缓存机制，提升响应速度
 - **响应式UI设计**: 完美适配各种设备屏幕
 - **实时数据同步**: 自动刷新机制，确保数据准确性
+
+## 📸 界面预览
+
+<div align="center">
+  <img src="images/示例图/1.png" alt="首页概览" width="45%">
+  <img src="images/示例图/2.png" alt="仓库管理" width="45%">
+  <br><br>
+  <img src="images/示例图/3.png" alt="标签详情" width="45%">
+  <img src="images/示例图/4.png" alt="标签详情2" width="45%">
+</div>
 
 ## 🏗️ 系统架构
 
@@ -50,13 +59,13 @@ Docker-Registry-Manager/
 ### 📦 Docker镜像策略
 正式版本发布时自动创建三个镜像标签（推送到GitHub Container Registry）：
 ```
-ghcr.io/your-username/docker-registry-manager:v1.7.1    # 具体版本
-ghcr.io/your-username/docker-registry-manager:v1.7      # 大版本  
+ghcr.io/your-username/docker-registry-manager:v1.1.1    # 具体版本
+ghcr.io/your-username/docker-registry-manager:v1.1      # 大版本  
 ghcr.io/your-username/docker-registry-manager:latest    # 最新版本
 ```
 
 ### 🏷️ 标签分类规则
-- **正式版本** (`v1.7.1`, `v2.1.5`): 自动构建镜像 + 创建Release
+- **正式版本** (`v1.1.1`, `v2.1.5`): 自动构建镜像 + 创建Release
 - **预发布版本** (`beta`, `rc1`, `dev-feature`): 仅创建标签，无构建
 
 
@@ -84,21 +93,17 @@ docker-compose ps
 
 ### 访问地址
 - **Web管理界面**: http://localhost:5001
-- **Registry API**: http://localhost:5000/v2/
 
 ## 📦 核心功能
 
 ### 🗂️ 镜像管理
 - **仓库浏览**: 直观的卡片式仓库展示
 - **标签管理**: 支持标签详情查看和删除操作
-- **搜索筛选**: 按名称、分类等条件快速查找
 - **批量操作**: 支持多标签同时管理
 
 ### 💾 存储监控
 - **实时统计**: 存储使用情况实时展示
-- **空间预警**: 磁盘空间不足提醒
-- **垃圾回收**: 一键清理未引用镜像层
-- **容量分析**: 详细的存储使用报告
+- **垃圾回收**: 自动清理未引用镜像层
 
 ### 🔧 系统运维
 - **健康检查**: Registry服务状态监控
@@ -126,7 +131,7 @@ docker-compose ps
 # docker-compose.yml 关键配置
 environment:
   - REGISTRY_BASE_URL=http://registry:5000    # Registry内部地址
-  - REGISTRY_HOST=localhost:5000              # 外部访问地址
+  - REGISTRY_HOST=localhost:5000              # 外部访问地址，用于显示镜像仓库地址
   - REDIS_HOST=redis                         # Redis服务地址
   - REDIS_PORT=6379                          # Redis端口
 ```
@@ -134,7 +139,7 @@ environment:
 ### 存储配置
 ```
 volumes:
-  - ./data/registry:/var/lib/registry:ro     # Registry数据只读挂载
+  - ./data/registry:/var/lib/registry:ro     # Registry镜像数据只读挂载，用于存储空间大小判断
   - /var/run/docker.sock:/var/run/docker.sock # Docker Socket
 ```
 
@@ -153,21 +158,6 @@ GET    /api/storage               # 存储状态
 GET    /api/health                # 健康检查
 POST   /api/gc                    # 垃圾回收
 POST   /api/restart-registry      # 重启Registry
-```
-
-## 🛠️ 开发指南
-
-### 本地开发环境
-```bash
-# 安装依赖
-pip install -r requirements.txt
-
-# 启动后端服务
-cd backend
-python run.py
-
-# 前端开发 (直接打开frontend/index.html)
-```
 
 ### 代码结构说明
 - `backend/api.py`: 主要API路由和业务逻辑
@@ -198,7 +188,6 @@ python run.py
 
 ### 缓存策略
 - **Redis缓存**: 减少Registry API调用频率
-- **内存缓存**: 提升热点数据访问速度
 - **智能失效**: 基于文件修改时间的缓存更新
 
 ### 最佳实践
@@ -216,10 +205,6 @@ docker-compose ps
 # 查看日志
 docker-compose logs -f web-ui
 docker-compose logs -f registry
-
-# 备份数据
-tar -czf backup-$(date +%Y%m%d).tar.gz data/
-```
 
 ### 版本升级
 ```bash
@@ -239,25 +224,8 @@ docker-compose up -d
 3. **镜像操作异常**: 验证Registry配置和权限
 4. **界面显示异常**: 清除浏览器缓存
 
-### 日志查看
-```
-# 后端日志
-docker-compose logs web-ui
+`
 
-# Registry日志  
-docker-compose logs registry
-
-# 系统日志
-docker-compose logs
-```
-
-## 🤝 贡献指南
-
-### 开发流程
-1. Fork项目仓库
-2. 创建功能分支
-3. 提交代码变更
-4. 发起Pull Request
 
 ### 代码规范
 - 遵循PEP 8 Python编码规范
@@ -298,4 +266,4 @@ docker-compose logs
 ---
 
 *最后更新: 2026年2月8日*  
-*文档版本: v1.7.1*
+*文档版本: v1.1.1*
