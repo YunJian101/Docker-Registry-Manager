@@ -1,46 +1,41 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Docker Registry Web UI - 专业的Web管理界面
-支持镜像管理、存储清理、健康监控等功能
+Docker Registry Manager Backend API
+Docker镜像仓库管理后端API
 """
 
-from flask import Flask, request, jsonify, render_template, send_from_directory
-#from flask_cors import CORS, cross_origin  # 移除CORS导入
 import os
 import logging
 import requests
-from urllib.parse import quote, unquote
-import json
-import time
-import docker  # 添加docker导入
-from pathlib import Path  # 添加Path导入
+from pathlib import Path
+from urllib.parse import unquote
+from flask import Flask, jsonify, request, render_template
+from flask_cors import CORS
+import docker
 
-# 开发环境下直接导入（避免相对导入问题）
-import sys
-sys.path.append('/app/backend')
-from registry_api import registry_client
-from config import ensure_directories  # 导入ensure_directories函数
+# 隐藏Flask开发服务器警告
+import warnings
+warnings.filterwarnings("ignore", message=".*development server.*")
 
-# 导入正确的缓存模块
-try:
-    from cache import mirror_cache
-except ImportError:
-    # 如果导入失败，创建一个简单的mock
-    class MockMirrorCache:
-        def get_repo_info(self, repository):
-            return {
-                "name": repository,
-                "description": f"这是一个Docker镜像仓库: {repository}",
-                "category": "unknown",
-                "tags": []
-            }
-        def update_repo_info(self, repository, description, category=None, tags=None):
-            return True
-    mirror_cache = MockMirrorCache()
-
-app = Flask(__name__)
+# 使用标准日志配置
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger('registry_web')
+logger = logging.getLogger('registry_backend')
+
+# 创建Flask应用实例
+app = Flask(__name__, template_folder='../frontend')
+CORS(app)  # 启用CORS支持
+
+# 导入后端模块
+from backend.config import (
+    CONFIG_DIR, MIRROR_FILE_PATH,
+    REGISTRY_BASE_URL, REGISTRY_HOST,
+    DEBUG_MODE, LOG_LEVEL,
+    ensure_directories, get_registry_config
+)
+# 使用Redis缓存替换原来的文件缓存
+from backend.cache import redis_cache as mirror_cache
+from backend.registry_api import registry_client
 
 # 确保必要的目录存在
 ensure_directories()
@@ -56,7 +51,7 @@ ensure_directories()
 @app.route('/')
 def index():
     """主页面"""
-    return send_from_directory('../frontend', 'index.html')
+    return render_template('index.html')
 
 def get_data_path():
     """获取数据目录路径"""
@@ -98,21 +93,44 @@ def get_directory_size(path):
 
 @app.route('/api/repositories')
 def api_repositories():
-    """API: 获取所有仓库（包含空仓库状态）"""
-    repositories = registry_client.get_repositories()
+    """API: 获取所有仓库（包含空仓库状态） - 使用Redis缓存（永久有效）"""
+    # 先尝试从缓存获取
+    cache_key = "api:repositories"
+    cached_result = mirror_cache.get_cached_api_result(cache_key)
+    if cached_result:
+        logger.debug("从Redis缓存返回仓库列表")
+        return jsonify(cached_result)
     
-    # 为每个仓库获取标签信息
-    repositories_with_status = []
-    for repo in repositories:
-        tags = registry_client.get_tags(repo)
-        repositories_with_status.append({
-            'name': repo,
-            'tags': tags,
-            'tag_count': len(tags),
-            'empty': len(tags) == 0
-        })
-    
-    return jsonify({'repositories': repositories_with_status})
+    # 缓存未命中，调用实际API
+    try:
+        repositories = registry_client.get_repositories()
+        
+        # 为每个仓库获取标签信息
+        repositories_with_status = []
+        for repo in repositories:
+            tags = registry_client.get_tags(repo)
+            repositories_with_status.append({
+                'name': repo,
+                'tags': tags,
+                'tag_count': len(tags),
+                'empty': len(tags) == 0
+            })
+        
+        response_data = {'repositories': repositories_with_status}
+        
+        # 只有在成功获取到有效数据时才缓存
+        if repositories_with_status and len(repositories_with_status) > 0:
+            # 缓存结果到Redis，设置永久有效（1年）
+            mirror_cache.cache_api_result(cache_key, response_data, ttl=86400*365)
+            logger.info("仓库列表API调用成功，结果已永久缓存到Redis")
+        else:
+            logger.warning("仓库列表API返回空结果，跳过缓存")
+        
+        return jsonify(response_data)
+        
+    except Exception as e:
+        logger.error(f"获取仓库列表失败: {e}")
+        return jsonify({'repositories': []}), 500
 
 @app.route('/api/repository/<path:repository>/tags')
 def api_tags(repository: str):
@@ -150,13 +168,32 @@ def api_delete_tag(repository, tag):
                 
                 logger.info(f"标签删除成功: {repository}:{tag}, 释放空间: {freed_bytes} bytes")
                 
-                # 清除相关缓存
-                try:
-                    cache.invalidate_cache(f"registry:repo:{repository}*")
-                    cache.invalidate_cache(f"registry:manifest:{repository}:{tag}")
-                    cache.invalidate_cache("registry:repos:list")
-                except Exception as e:
-                    logger.warning(f"清除缓存失败 {repository}:{tag}: {e}")
+                # 清除所有相关缓存（加强缓存清除）
+                cache_keys_to_clear = [
+                    # Registry相关缓存
+                    f"registry:repo:{repository}*",
+                    f"registry:manifest:{repository}:{tag}",
+                    "registry:repos:list",
+                    # API缓存
+                    "api:repositories",
+                    "api:storage",
+                    f"api:description:{repository}",
+                    f"api:details:{repository}",
+                    # 模糊匹配清除
+                    f"api:description:*",
+                    f"api:details:*"
+                ]
+                
+                cleared_count = 0
+                for cache_key in cache_keys_to_clear:
+                    try:
+                        mirror_cache._invalidate_cache(cache_key)
+                        logger.info(f"已清除缓存: {cache_key}")
+                        cleared_count += 1
+                    except Exception as e:
+                        logger.warning(f"清除缓存失败 {cache_key}: {e}")
+                
+                logger.info(f"删除操作后共清除 {cleared_count} 个缓存项")
                 
                 return jsonify({
                     'success': True,
@@ -164,7 +201,8 @@ def api_delete_tag(repository, tag):
                     'repository': repository,
                     'tag': tag,
                     'freed_bytes': freed_bytes,
-                    'gc_result': result.get('gc_result', {})
+                    'gc_result': result.get('gc_result', {}),
+                    'cache_cleared': cleared_count
                 })
             except Exception as size_error:
                 logger.warning(f"计算释放空间失败: {size_error}")
@@ -185,6 +223,14 @@ def api_delete_tag(repository, tag):
                 'tag': tag
             }), 500
             
+    except requests.exceptions.RequestException as e:
+        logger.error(f"删除标签网络请求失败: {e}")
+        return jsonify({
+            'success': False,
+            'message': '网络请求失败',
+            'repository': repository,
+            'tag': tag
+        }), 502
     except Exception as e:
         logger.error(f"删除标签时发生错误: {e}")
         return jsonify({
@@ -204,26 +250,57 @@ def api_delete_repository(repository: str):
         # 使用带垃圾回收的删除方法
         result = registry_client.delete_repository_with_gc(repository)
         
-        # 清除相关缓存
+        # 清除所有相关缓存（加强缓存清除）
         cache_keys_to_clear = [
+            # Registry相关缓存
             f"registry:repo:{repository}*",
-            "registry:repos:list"
+            "registry:repos:list",
+            # API缓存
+            "api:repositories",
+            "api:storage",
+            f"api:description:{repository}",
+            f"api:details:{repository}",
+            # 模糊匹配清除所有描述和详情缓存
+            "api:description:*",
+            "api:details:*"
         ]
         
+        cleared_count = 0
         for cache_key in cache_keys_to_clear:
             try:
                 mirror_cache._invalidate_cache(cache_key)
                 logger.info(f"已清除缓存: {cache_key}")
+                cleared_count += 1
             except Exception as cache_error:
                 logger.warning(f"清除缓存失败 {cache_key}: {cache_error}")
         
+        logger.info(f"删除仓库操作后共清除 {cleared_count} 个缓存项")
+        
         if result['success']:
             logger.info(f"仓库删除成功: {repository}")
-            return jsonify(result)
+            return jsonify({
+                'success': True,
+                'message': f'仓库 {repository} 删除成功',
+                'repository': repository,
+                'result': result,
+                'cache_cleared': cleared_count
+            })
         else:
             logger.error(f"仓库删除失败: {repository}, 错误: {result.get('message', '未知错误')}")
-            return jsonify(result), 500
+            return jsonify({
+                'success': False,
+                'message': result.get('message', '仓库删除失败'),
+                'repository': repository,
+                'result': result
+            }), 500
             
+    except requests.exceptions.RequestException as e:
+        logger.error(f"删除仓库网络请求失败 {repository}: {e}")
+        return jsonify({
+            'success': False,
+            'message': '网络请求失败',
+            'repository': repository
+        }), 502
     except Exception as e:
         logger.error(f"删除仓库异常 {repository}: {e}")
         return jsonify({
@@ -234,7 +311,15 @@ def api_delete_repository(repository: str):
 
 @app.route('/api/storage')
 def api_storage():
-    """API: 获取存储信息 - 计算本地存储目录大小"""
+    """API: 获取存储信息 - 计算本地存储目录大小 - 使用Redis缓存（永久有效）"""
+    # 先尝试从缓存获取
+    cache_key = "api:storage"
+    cached_result = mirror_cache.get_cached_api_result(cache_key)
+    if cached_result:
+        logger.debug("从Redis缓存返回存储信息")
+        return jsonify(cached_result)
+    
+    # 缓存未命中，调用实际API
     try:
         # 计算Registry存储目录总大小
         registry_path = Path('/var/lib/registry')
@@ -263,7 +348,7 @@ def api_storage():
         
         repositories = registry_client.get_repositories()
         
-        return jsonify({
+        response_data = {
             'success': True,
             'data': {
                 'total_size_bytes': total_size_bytes,
@@ -275,9 +360,32 @@ def api_storage():
                 'repository_count': len(repositories),
                 'status': 'healthy'
             }
-        })
+        }
+        
+        # 只有在成功获取到有效数据时才缓存（检查数值合理性）
+        if (total_size_bytes >= 0 and 
+            available_bytes >= 0 and 
+            len(repositories) >= 0 and
+            response_data['success'] == True):
+            # 缓存结果到Redis，设置永久有效（1年）
+            mirror_cache.cache_api_result(cache_key, response_data, ttl=86400*365)
+            logger.info("存储信息API调用成功，结果已永久缓存到Redis")
+        else:
+            logger.warning("存储信息API返回无效结果，跳过缓存")
+        
+        return jsonify(response_data)
+    except requests.exceptions.RequestException as e:
+        logger.error(f"存储信息API网络请求失败: {e}")
+        return jsonify({'success': False, 'error': '网络请求失败'}), 502
+    except FileNotFoundError:
+        logger.error("存储路径不存在")
+        return jsonify({'success': False, 'error': '存储路径不存在'}), 404
+    except PermissionError:
+        logger.error("无权限访问存储路径")
+        return jsonify({'success': False, 'error': '无权限访问'}), 403
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        logger.error(f"获取存储信息失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/cleanup', methods=['POST'])
 def api_cleanup():
@@ -490,9 +598,18 @@ def api_garbage_collection():
 
 @app.route('/api/repository/<path:repository>/details')
 def api_repository_details(repository: str):
-    """获取仓库的详细信息（使用增强的manifest数据）"""
+    """获取仓库的详细信息 - 使用Redis缓存（永久有效）"""
     try:
         repository = unquote(repository)
+        
+        # 先尝试从缓存获取
+        cache_key = f"api:details:{repository}"
+        cached_result = mirror_cache.get_cached_api_result(cache_key)
+        if cached_result:
+            logger.debug(f"从Redis缓存返回仓库详情: {repository}")
+            return jsonify(cached_result)
+        
+        # 缓存未命中，调用实际API
         tags = registry_client.get_tags(repository)
         
         # 获取每个标签的详细信息
@@ -512,22 +629,44 @@ def api_repository_details(repository: str):
                 'os': manifest.get('os', '未知')
             })
         
-        return jsonify({
+        response_data = {
             'success': True,
             'repository': repository,
             'tag_count': len(tags),
             'tags': tag_details
-        })
+        }
+        
+        # 只有在成功获取到有效数据时才缓存
+        if tags is not None and len(tags) >= 0 and response_data['success'] == True:
+            # 缓存结果到Redis，设置永久有效（1年）
+            mirror_cache.cache_api_result(cache_key, response_data, ttl=86400*365)
+            logger.info(f"仓库详情API调用成功，结果已永久缓存到Redis: {repository}")
+        else:
+            logger.warning(f"仓库详情API返回无效结果，跳过缓存: {repository}")
+        
+        return jsonify(response_data)
+    except requests.exceptions.RequestException as e:
+        logger.error(f"仓库详情API网络请求失败 {repository}: {e}")
+        return jsonify({'success': False, 'error': '网络请求失败'}), 502
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        logger.error(f"获取仓库详情失败 {repository}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/repository/<path:repository>/tag/<tag>')
 def api_tag_details(repository: str, tag: str):
-    """获取单个标签的详细信息"""
+    """获取单个标签的详细信息 - 使用Redis缓存（永久有效）"""
     try:
         repository = unquote(repository)
         tag = unquote(tag)
         
+        # 先尝试从缓存获取
+        cache_key = f"api:tag:{repository}:{tag}"
+        cached_result = mirror_cache.get_cached_api_result(cache_key)
+        if cached_result:
+            logger.debug(f"从Redis缓存返回标签详情: {repository}:{tag}")
+            return jsonify(cached_result)
+        
+        # 缓存未命中，调用实际API
         # 获取详细的manifest信息
         manifest = registry_client.get_manifest(repository, tag)
         
@@ -579,14 +718,31 @@ def api_tag_details(repository: str, tag: str):
                     logger.warning(f"获取详细config信息失败: {e}")
                     pass
         
-        logger.info(f"标签详情API返回 - 层数: {tag_info['layers_count']}, 有层: {tag_info['has_layers']}")
-        return jsonify({
+        response_data = {
             'success': True,
             'data': tag_info
-        })
+        }
+        
+        # 只有在成功获取到有效数据时才缓存
+        if (tag_info and 
+            tag_info.get('size', -1) >= 0 and 
+            tag_info.get('layers_count', -1) >= 0 and
+            response_data['success'] == True):
+            # 缓存结果到Redis，设置永久有效（1年）
+            mirror_cache.cache_api_result(cache_key, response_data, ttl=86400*365)
+            logger.info(f"标签详情API调用成功，结果已永久缓存到Redis: {repository}:{tag}")
+        else:
+            logger.warning(f"标签详情API返回无效结果，跳过缓存: {repository}:{tag}")
+        
+        logger.info(f"标签详情API返回 - 层数: {tag_info['layers_count']}, 有层: {tag_info['has_layers']}")
+        return jsonify(response_data)
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"标签详情API网络请求失败 {repository}:{tag}: {e}")
+        return jsonify({'success': False, 'error': '网络请求失败'}), 502
     except Exception as e:
         logger.error(f"获取标签详情失败 {repository}:{tag}: {e}")
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/restart-registry', methods=['POST'])
 def api_restart_registry():
@@ -637,13 +793,35 @@ def api_restart_registry():
 
 @app.route('/api/registry-host')
 def api_registry_host():
-    """API: 获取配置的registry地址"""
-    import os
-    registry_host = os.environ.get('REGISTRY_HOST', 'r.ue6.fun:8888')
-    return jsonify({
-        'success': True,
-        'host': registry_host
-    })
+    """API: 获取配置的registry地址 - 使用Redis缓存（永久有效）"""
+    # 先尝试从缓存获取
+    cache_key = "api:registry-host"
+    cached_result = mirror_cache.get_cached_api_result(cache_key)
+    if cached_result:
+        logger.debug("从Redis缓存返回registry地址")
+        return jsonify(cached_result)
+    
+    # 缓存未命中，调用实际API
+    try:
+        import os
+        registry_host = os.environ.get('REGISTRY_HOST', 'r.ue6.fun:8888')
+        response_data = {
+            'success': True,
+            'host': registry_host
+        }
+        
+        # 只有在成功获取到有效数据时才缓存
+        if registry_host and len(registry_host) > 0 and response_data['success'] == True:
+            # 缓存结果到Redis，设置永久有效（1年）
+            mirror_cache.cache_api_result(cache_key, response_data, ttl=86400*365)
+            logger.info("Registry地址API调用成功，结果已永久缓存到Redis")
+        else:
+            logger.warning("Registry地址API返回空结果，跳过缓存")
+        
+        return jsonify(response_data)
+    except Exception as e:
+        logger.error(f"获取registry地址失败: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/health')
 def api_health():
@@ -695,15 +873,36 @@ def api_health():
 
 @app.route('/api/repository/<path:repository>/description')
 def api_repository_description(repository: str):
-    """API: 获取仓库的描述信息（使用缓存）"""
+    """API: 获取仓库的描述信息 - 使用Redis缓存（永久有效）"""
     try:
         repository = unquote(repository)
-        # 使用缓存类获取仓库信息
+        
+        # 先尝试从缓存获取
+        cache_key = f"api:description:{repository}"
+        cached_result = mirror_cache.get_cached_api_result(cache_key)
+        if cached_result:
+            logger.debug(f"从Redis缓存返回仓库描述: {repository}")
+            return jsonify(cached_result)
+        
+        # 缓存未命中，调用实际API
         description_data = mirror_cache.get_repo_info(repository)
-        return jsonify({'success': True, 'data': description_data})
+        response_data = {'success': True, 'data': description_data}
+        
+        # 只有在成功获取到有效数据时才缓存
+        if description_data is not None and response_data['success'] == True:
+            # 缓存结果到Redis，设置永久有效（1年）
+            mirror_cache.cache_api_result(cache_key, response_data, ttl=86400*365)
+            logger.info(f"仓库描述API调用成功，结果已永久缓存到Redis: {repository}")
+        else:
+            logger.warning(f"仓库描述API返回空结果，跳过缓存: {repository}")
+        
+        return jsonify(response_data)
+    except requests.exceptions.RequestException as e:
+        logger.error(f"仓库描述API网络请求失败 {repository}: {e}")
+        return jsonify({'success': False, 'error': '网络请求失败'}), 502
     except Exception as e:
         logger.error(f"获取仓库描述失败 {repository}: {e}")
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/repository/<path:repository>/description', methods=['POST'])
 def api_update_repository_description(repository: str):
@@ -720,12 +919,112 @@ def api_update_repository_description(repository: str):
         success = mirror_cache.update_repo_info(repository, description, category, tags)
         
         if success:
-            return jsonify({'success': True, 'message': '描述信息更新成功'})
+            # 更新成功后清除相关缓存
+            cache_keys_to_clear = [
+                f"api:description:{repository}",
+                "api:repositories",  # 仓库列表可能包含描述信息
+                f"api:details:{repository}"  # 详情可能引用描述信息
+            ]
+            
+            cleared_count = 0
+            for cache_key in cache_keys_to_clear:
+                try:
+                    mirror_cache._invalidate_cache(cache_key)
+                    logger.info(f"已清除缓存: {cache_key}")
+                    cleared_count += 1
+                except Exception as e:
+                    logger.warning(f"清除缓存失败 {cache_key}: {e}")
+            
+            logger.info(f"更新描述后共清除 {cleared_count} 个缓存项")
+            
+            return jsonify({
+                'success': True, 
+                'message': '描述信息更新成功',
+                'repository': repository,
+                'cache_cleared': cleared_count
+            })
         else:
-            return jsonify({'success': False, 'error': '更新失败'})
+            return jsonify({
+                'success': False, 
+                'error': '更新失败',
+                'repository': repository
+            })
+    except requests.exceptions.RequestException as e:
+        logger.error(f"更新仓库描述网络请求失败 {repository}: {e}")
+        return jsonify({
+            'success': False,
+            'error': '网络请求失败',
+            'repository': repository
+        }), 502
     except Exception as e:
         logger.error(f"更新仓库描述失败 {repository}: {e}")
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({
+            'success': False, 
+            'error': str(e),
+            'repository': repository
+        })
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
