@@ -136,3 +136,4 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "### Actions Performed:" >> $GITHUB_STEP_SUMMARY
             echo "- Created tag only (no release, no docker build)" >> $GITHUB_STEP_SUMMARY
+          fi
