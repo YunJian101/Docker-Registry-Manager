@@ -5,7 +5,7 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)，
 本项目遵循 [语义化版本控制](https://semver.org/spec/v2.0.0.html)。··
 
-## [v1.7.1] - 2026-02-08
+## [v1.1.1] - 2026-02-08
 ### 新增
 - GitHub Actions自动化发布流程完整实现
 - 三标签Docker镜像构建策略 (具体版本/大版本/latest)

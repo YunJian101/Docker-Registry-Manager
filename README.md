@@ -4,7 +4,7 @@
 
 Docker Registry Manager 是一个现代化的私有Docker镜像仓库Web管理平台，采用前后端分离架构设计。基于Python Flask后端和原生Web前端技术栈，提供直观易用的图形化界面来管理和监控Docker Registry服务。
 
-**当前版本**: v1.7.1
+**当前版本**: v1.1.1
 
 ### 🎯 核心特性
 - **前后端分离架构**: 清晰的代码结构，便于维护和扩展
@@ -59,18 +59,7 @@ ghcr.io/your-username/docker-registry-manager:latest    # 最新版本
 - **正式版本** (`v1.7.1`, `v2.1.5`): 自动构建镜像 + 创建Release
 - **预发布版本** (`beta`, `rc1`, `dev-feature`): 仅创建标签，无构建
 
-### 🔄 发布流程示例（零配置！）
-```bash
-# 发布正式版本 v1.7.1 - 完全自动，无需任何配置
-git tag v1.7.1
-git push origin v1.7.1
 
-# 系统自动执行：
-# 1. ✅ 构建Docker镜像（三个标签）
-# 2. ✅ 推送到GitHub Container Registry
-# 3. ✅ 从CHANGELOG.md提取更新日志
-# 4. ✅ 创建GitHub Release（标题为 v1.7.1）
-```
 
 ## 🚀 快速开始
 
