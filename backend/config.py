@@ -10,7 +10,6 @@ from pathlib import Path
 
 # 基础配置
 CONFIG_DIR = "/app/config"
-DATA_DIR = "/app/data"
 MIRROR_FILE_PATH = f"{CONFIG_DIR}/Mirror.json"
 
 # Registry 配置
@@ -38,10 +37,9 @@ def get_mirror_file_path() -> Path:
     return Path(MIRROR_FILE_PATH)
 
 def ensure_directories():
-    """确保必要的目录存在"""
-    dirs = [CONFIG_DIR, DATA_DIR]
-    for dir_path in dirs:
-        Path(dir_path).mkdir(parents=True, exist_ok=True)
+    """确保必要的配置目录存在（不创建data目录）"""
+    # 只创建配置目录，data目录由用户或docker-compose管理
+    Path(CONFIG_DIR).mkdir(parents=True, exist_ok=True)
 
 def get_registry_config() -> dict:
     """获取Registry配置信息"""

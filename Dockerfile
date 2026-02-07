@@ -14,9 +14,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# 创建配置和数据目录（确保容器启动时能自动创建Mirror.json）
-RUN mkdir -p /app/config && chmod 777 /app/config && \
-    mkdir -p /app/data && chmod 777 /app/data
+# 创建配置目录（确保容器启动时能自动创建Mirror.json）
+RUN mkdir -p /app/config && chmod 777 /app/config
 
 # 暴露端口
 EXPOSE 5001
